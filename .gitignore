@@ -22,6 +22,7 @@ data/
 *.zip
 *.tar.gz
 *.sqlite3
+*.geojson
 
 # --- Clés d'API et variables d'environnement confidentielles ---
 .env
