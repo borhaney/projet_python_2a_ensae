@@ -24,6 +24,7 @@ data/
 *.sqlite3
 *.geojson
 *.txt
+!requirements.txt
 
 # --- Clés d'API et variables d'environnement confidentielles ---
 .env
