@@ -35,3 +35,7 @@ Thumbs.db
 
 # --- Dossiers VS Code locaux ---
 .vscode/
+
+iris.gpkg
+
+*.xls

@@ -1,4 +1,5 @@
-import os
+from pathlib import Path
+
 import pandas as pd
 import geopandas as gpd
 from shapely.ops import unary_union
@@ -7,13 +8,49 @@ from shapely.ops import unary_union
 # tout le reste du code (et le notebook) utilise "code_iris".
 COL_IRIS = "code_iris"
 
-CANDIDATS_COL_IRIS = ("code_iris", "iris", "CODE_IRIS", "DCOMIRIS")
+CANDIDATS_COL_IRIS = ("code_iris", "iris", "CODE_IRIS", "DCOMIRIS", "codeiris")
+DOSSIER_PROJET = Path(__file__).resolve().parent
+
+
+def _trouver_fichier(nom_fichier, dossier=None):
+    """Recherche un fichier dans un dossier fourni, puis dans le dépôt."""
+    candidats = []
+    if dossier is not None:
+        candidats.append(Path(dossier) / nom_fichier)
+    candidats.extend([
+        Path.cwd() / nom_fichier,
+        DOSSIER_PROJET / nom_fichier,
+        DOSSIER_PROJET / "data" / nom_fichier,
+        DOSSIER_PROJET / "data" / "raw" / nom_fichier,
+    ])
+
+    for candidat in candidats:
+        if candidat.is_file():
+            return candidat
+
+    # Le nom exact peut être dans un sous-dossier de données.
+    recherche = DOSSIER_PROJET if dossier is None else Path(dossier)
+    correspondances = sorted(recherche.glob(f"**/{nom_fichier}"))
+    if correspondances:
+        return correspondances[0]
+
+    raise FileNotFoundError(
+        f"Fichier introuvable : {nom_fichier}. "
+        f"Répertoire recherché : {recherche}"
+    )
 
 
 def _trouver_colonne_iris(gdf):
     """Renvoie le nom réel de la colonne IRIS dans un GeoDataFrame."""
     for col in CANDIDATS_COL_IRIS:
         if col in gdf.columns:
+            return col
+    for col in gdf.columns:
+        if str(col).lower().replace("_", "").replace(" ", "") in {
+            "codeiris",
+            "iris",
+            "dcomiris",
+        }:
             return col
     raise ValueError(
         f"Aucune colonne IRIS trouvée. Colonnes disponibles : {list(gdf.columns)}"
@@ -29,7 +66,7 @@ def _normaliser_colonne_iris(gdf):
     return gdf
 
 
-def charger_carte_et_transports(code_insee="93070"):
+def charger_carte_et_transports(code_insee="93070", dossier=None):
     """Charge les IRIS, le tracé de la ligne 14 et les stations filtrées sur la commune.
 
     Parameters
@@ -42,8 +79,17 @@ def charger_carte_et_transports(code_insee="93070"):
     tuple de GeoDataFrame : (IRIS de la commune, ligne 14, stations proches)
     """
     # 1. Fond IRIS
-    gdf_iris = gpd.read_file("IDF_iris.geojson")
-    col_insee = "insee_com" if "insee_com" in gdf_iris.columns else "depcom"
+    gdf_iris = gpd.read_file(_trouver_fichier("IDF_iris.geojson", dossier))
+    col_insee = next(
+        (col for col in ("insee_com", "depcom", "code_commune", "insee")
+         if col in gdf_iris.columns),
+        None,
+    )
+    if col_insee is None:
+        raise ValueError(
+            "Code commune introuvable dans les IRIS. "
+            f"Colonnes disponibles : {list(gdf_iris.columns)}"
+        )
     zone_etude = gdf_iris[
         gdf_iris[col_insee].astype(str) == str(code_insee)
     ].copy()
@@ -51,13 +97,18 @@ def charger_carte_et_transports(code_insee="93070"):
 
     # 2. Ligne 14
     ligne_14 = gpd.read_file(
-        "traces-des-lignes-de-transport-en-commun-idfm-2.geojson"
+        _trouver_fichier(
+            "traces-des-lignes-de-transport-en-commun-idfm-2.geojson",
+            dossier,
+        )
     )
     if ligne_14.crs != zone_etude.crs:
         ligne_14 = ligne_14.to_crs(zone_etude.crs)
 
     # 3. Stations
-    gdf_stations = gpd.read_file("emplacement-des-gares-idf.geojson")
+    gdf_stations = gpd.read_file(
+        _trouver_fichier("emplacement-des-gares-idf.geojson", dossier)
+    )
     if gdf_stations.crs != zone_etude.crs:
         gdf_stations = gdf_stations.to_crs(zone_etude.crs)
 
@@ -78,91 +129,132 @@ def charger_et_nettoyer_dvf(
     prix_m2_max=15000,
     surface_min=10,
     valeur_min=10000,
+    dossier=None,
 ):
-    """Charge et harmonise les fichiers DVF (.txt 2017-2020 et .csv 2021-2025)
-    puis filtre les ventes résidentielles non aberrantes.
-
-    Parameters
-    ----------
-    code_insee : str
-        Code INSEE de la commune.
-    prix_m2_min, prix_m2_max : float
-        Bornes de plausibilité du prix au m² (€/m²).
-    surface_min : float
-        Surface minimale du bâti (m²).
-    valeur_min : float
-        Valeur foncière minimale (€).
+    """Charge et harmonise les fichiers DVF géolocalisés (parquet 2018-2020,
+    CSV 2021-2025) puis filtre les ventes résidentielles non aberrantes.
 
     Returns
     -------
-    DataFrame : ventes de logements avec une colonne 'prix_m2' et 'annee'.
+    DataFrame : ventes de logements avec 'prix_m2', 'annee', 'longitude', 'latitude'.
     """
-    mapping_txt = {
-        "Date mutation": "date_mutation",
-        "Nature mutation": "nature_mutation",
-        "Valeur fonciere": "valeur_fonciere",
-        "Type local": "type_local",
-        "Surface reelle bati": "surface_reelle_bati",
-        "Nombre pieces principales": "nombre_pieces_principales",
-        "Code type local": "code_type_local",
-    }
-    mutations_gardees = ["Vente", "Vente en l'état futur d'achèvement"]
-    types_locaux = ["Appartement", "Maison"]
-
+    dossier = Path(dossier) if dossier is not None else DOSSIER_PROJET
     dfs = []
+    sources_chargees = []
+    code_insee = str(code_insee)
 
-    # 1. Fichiers .txt (2017-2020)
-    for annee in range(2017, 2021):
-        fichier = f"valeursfoncieres-{annee}.txt"
-        if not os.path.exists(fichier):
+    for annee in range(2017, 2026):
+        parquets = sorted(dossier.glob(f"**/*{annee}*.parquet"))
+        csv_commune = sorted(dossier.glob(f"**/{code_insee}.{annee}.csv"))
+        autres_csv = sorted(dossier.glob(f"**/*{annee}*.csv"))
+
+        source = parquets[0] if parquets else (
+            csv_commune[0] if csv_commune else (
+                autres_csv[0] if autres_csv else None
+            )
+        )
+        if source is None:
+            print(f"⚠️ {annee} : aucun fichier trouvé")
             continue
-        df_temp = pd.read_csv(
-            fichier,
-            sep="|",
-            decimal=",",
-            dtype={"Code departement": str, "Code commune": str},
-            low_memory=False,
-        )
-        c_insee = (
-            df_temp["Code departement"].astype(str).str.zfill(2)
-            + df_temp["Code commune"].astype(str).str.zfill(3)
-        )
-        df_temp = df_temp[c_insee == str(code_insee)].copy()
-        df_temp = df_temp.rename(columns=mapping_txt)
-        dfs.append(df_temp)
 
-    # 2. Fichiers .csv (2021-2025)
-    for annee in range(2021, 2026):
-        fichier = f"{code_insee}.{annee}.csv"
-        if os.path.exists(fichier):
-            dfs.append(pd.read_csv(fichier, low_memory=False))
+        df_temp = (
+            pd.read_parquet(source)
+            if source.suffix.lower() == ".parquet"
+            else pd.read_csv(source, low_memory=False)
+        )
+
+        df_temp = df_temp.rename(
+            columns={
+                "lon": "longitude",
+                "lat": "latitude",
+                "latitude": "latitude",
+                "longitude": "longitude",
+            }
+        )
+        noms_normalises = {
+            str(col).lower().replace("_", "").replace(" ", ""): col
+            for col in df_temp.columns
+        }
+        if "longitude" not in df_temp.columns:
+            for cle in ("lon", "longitude"):
+                if cle in noms_normalises:
+                    df_temp = df_temp.rename(
+                        columns={noms_normalises[cle]: "longitude"}
+                    )
+                    break
+        if "latitude" not in df_temp.columns:
+            for cle in ("lat", "latitude"):
+                if cle in noms_normalises:
+                    df_temp = df_temp.rename(
+                        columns={noms_normalises[cle]: "latitude"}
+                    )
+                    break
+
+        if "longitude" not in df_temp.columns or "latitude" not in df_temp.columns:
+            print(
+                f"⚠️ {source} : pas de longitude/latitude, ignoré. "
+                f"Colonnes : {df_temp.columns.tolist()}"
+            )
+            continue
+
+        # Filtre commune si le fichier contient une colonne commune
+        col_com = next(
+            (c for c in ("code_commune", "commune", "depcom",
+                         "code_insee", "insee_com")
+             if c in df_temp.columns),
+            None,
+        )
+        if col_com is not None:
+            df_temp = df_temp[
+                df_temp[col_com].astype(str).str.zfill(5) == code_insee
+            ].copy()
+
+        if not df_temp.empty:
+            df_temp["annee"] = annee
+            dfs.append(df_temp)
+            sources_chargees.append(str(source))
+            print(f"✔ {source} : {len(df_temp)} lignes pour {annee}")
 
     if not dfs:
-        raise FileNotFoundError("Aucun fichier DVF trouvé pour ce code INSEE.")
+        raise FileNotFoundError("Aucun fichier DVF exploitable trouvé.")
 
     df_dvf = pd.concat(dfs, ignore_index=True)
 
-    # Harmonisation des types
-    df_dvf["valeur_fonciere"] = pd.to_numeric(
-        df_dvf["valeur_fonciere"], errors="coerce"
-    )
-    df_dvf["surface_reelle_bati"] = pd.to_numeric(
-        df_dvf["surface_reelle_bati"], errors="coerce"
-    )
-    df_dvf["date_mutation"] = pd.to_datetime(
-        df_dvf["date_mutation"], format="mixed", dayfirst=True, errors="coerce"
-    )
-    df_dvf["annee"] = df_dvf["date_mutation"].dt.year
+    colonnes_obligatoires = {
+        "nature_mutation",
+        "type_local",
+        "valeur_fonciere",
+        "surface_reelle_bati",
+    }
+    colonnes_absentes = sorted(colonnes_obligatoires - set(df_dvf.columns))
+    if colonnes_absentes:
+        raise ValueError(
+            "Colonnes DVF obligatoires absentes : "
+            f"{colonnes_absentes}. Colonnes disponibles : "
+            f"{df_dvf.columns.tolist()}"
+        )
 
-    # Filtrage résidentiel & anti-aberrants (seuils explicitement paramétrés,
-    # à justifier dans le notebook)
-    logements = df_dvf[
-        df_dvf["nature_mutation"].isin(mutations_gardees)
-        & df_dvf["type_local"].isin(types_locaux)
-        & (df_dvf["surface_reelle_bati"] > surface_min)
-        & (df_dvf["valeur_fonciere"] > valeur_min)
-    ].copy()
+    for c in ("valeur_fonciere", "surface_reelle_bati", "longitude", "latitude"):
+        df_dvf[c] = pd.to_numeric(df_dvf[c], errors="coerce")
+    if "date_mutation" in df_dvf.columns:
+        df_dvf["date_mutation"] = pd.to_datetime(
+            df_dvf["date_mutation"], format="mixed", errors="coerce"
+        )
 
+    df_dvf["nature_mutation"] = df_dvf["nature_mutation"].astype(str).str.strip()
+    df_dvf["type_local"] = df_dvf["type_local"].astype(str).str.strip()
+
+    masque_base = (
+        df_dvf["nature_mutation"].isin(
+            ["Vente", "Vente en l'état futur d'achèvement"]
+        )
+        & df_dvf["type_local"].isin(["Appartement", "Maison"])
+        & df_dvf["surface_reelle_bati"].gt(surface_min)
+        & df_dvf["valeur_fonciere"].gt(valeur_min)
+        & df_dvf["longitude"].between(-5.5, 8.5)
+        & df_dvf["latitude"].between(41.0, 51.5)
+    )
+    logements = df_dvf.loc[masque_base].copy()
     logements["prix_m2"] = (
         logements["valeur_fonciere"] / logements["surface_reelle_bati"]
     )
@@ -170,63 +262,65 @@ def charger_et_nettoyer_dvf(
         logements["prix_m2"].between(prix_m2_min, prix_m2_max)
     ].copy()
 
+    print(
+        "Filtre DVF terminé : "
+        f"{len(logements)} ventes retenues sur {len(df_dvf)} lignes chargées."
+    )
     return logements
 
-def agreger_dvf_par_iris(df_logements, zone_etude):
-  """Agrège le prix médian DVF par IRIS.
 
-  Priorise le code IRIS s'il est déjà présent dans DVF, sinon réalise une
-  jointure spatiale.
-  """
-  zone_etude_copy = zone_etude.copy()
-  col_iris = "code_iris"
-
-  # 1. Vérifier si une colonne IRIS existe déjà dans df_logements
-  cols_possibles = [
-      "code_iris",
-      "iris",
-      "CODE_IRIS",
-      "code_commune_iris",
-      "code_insee_iris",
-  ]
-  col_dvf = next((c for c in cols_possibles if c in df_logements.columns), None)
-
-  if col_dvf is not None:
-    # Agrégation directe par code IRIS (rapide et sans bug de géométrie)
-    df_temp = df_logements.copy()
-    df_temp[col_iris] = df_temp[col_dvf].astype(str)
-    dvf_iris = (
-        df_temp.groupby(col_iris)["prix_m2"]
-        .agg(prix_m2_median="median", nb_ventes="count")
-        .reset_index()
+def rattacher_ventes_aux_iris(df_logements, zone_etude):
+    """Joint chaque vente à un IRIS avec une clé textuelle commune."""
+    colonnes_absentes = {"longitude", "latitude", "prix_m2"} - set(
+        df_logements.columns
     )
-  else:
-    # 2. Jointure spatiale uniquement si le code IRIS est absent
-    df_clean = df_logements.dropna(subset=["longitude", "latitude"]).copy()
+    if colonnes_absentes:
+        raise ValueError(
+            "Colonnes DVF absentes pour le rattachement : "
+            f"{sorted(colonnes_absentes)}"
+        )
+
+    ventes = df_logements.dropna(subset=["longitude", "latitude"]).copy()
     gdf_ventes = gpd.GeoDataFrame(
-        df_clean,
+        ventes,
         geometry=gpd.points_from_xy(
-            df_clean["longitude"], df_clean["latitude"]
+            ventes["longitude"],
+            ventes["latitude"],
         ),
         crs="EPSG:4326",
     )
-    if gdf_ventes.crs != zone_etude_copy.crs:
-      gdf_ventes = gdf_ventes.to_crs(zone_etude_copy.crs)
+    if gdf_ventes.crs != zone_etude.crs:
+        gdf_ventes = gdf_ventes.to_crs(zone_etude.crs)
 
-    ventes_avec_iris = gpd.sjoin(
-        gdf_ventes, zone_etude_copy, how="inner", predicate="within"
+    zone = zone_etude.copy()
+    zone[COL_IRIS] = zone[COL_IRIS].astype(str)
+    rattachees = gpd.sjoin(
+        gdf_ventes,
+        zone[[COL_IRIS, "geometry"]],
+        how="left",
+        predicate="within",
     )
+    rattachees = rattachees.drop(columns=["index_right"], errors="ignore")
+    return rattachees
+
+
+def agreger_dvf_par_iris(df_logements, zone_etude):
+    """Agrège le prix médian au m² par IRIS après jointure spatiale."""
+    ventes_avec_iris = rattacher_ventes_aux_iris(df_logements, zone_etude)
+    ventes_avec_iris = ventes_avec_iris[
+        ventes_avec_iris[COL_IRIS].notna()
+    ].copy()
+
     dvf_iris = (
-        ventes_avec_iris.groupby(col_iris)["prix_m2"]
+        ventes_avec_iris.groupby(COL_IRIS)["prix_m2"]
         .agg(prix_m2_median="median", nb_ventes="count")
         .reset_index()
     )
+    dvf_iris[COL_IRIS] = dvf_iris[COL_IRIS].astype(str)
 
-  zone_etude_copy[col_iris] = zone_etude_copy[col_iris].astype(str)
-  dvf_iris[col_iris] = dvf_iris[col_iris].astype(str)
-
-  return zone_etude_copy.merge(dvf_iris, on=col_iris, how="left")
-
+    zone_etude_copy = zone_etude.copy()
+    zone_etude_copy[COL_IRIS] = zone_etude_copy[COL_IRIS].astype(str)
+    return zone_etude_copy.merge(dvf_iris, on=COL_IRIS, how="left")
 
 def calculer_zones_tampons(
     zone_etude, stations, dist_traitee=500, dist_etendue=800
@@ -294,7 +388,21 @@ def cadrer_carte(ax, gdf, marge=0.05):
 
 def etiqueter_stations(ax, stations, fontsize=9.5):
     """Étiquette les stations (gère les variantes de nom de colonne)."""
-    col_nom = "nom_ZdA" if "nom_ZdA" in stations.columns else "nom_zda"
+    col_nom = next(
+        (
+            col for col in stations.columns
+            if str(col).lower() in {
+                "nom_zda",
+                "nom_zda ",
+                "nom",
+                "libelle",
+                "name",
+            }
+        ),
+        None,
+    )
+    if col_nom is None:
+        return
     for _, row in stations.iterrows():
         ax.text(
             row.geometry.x,
