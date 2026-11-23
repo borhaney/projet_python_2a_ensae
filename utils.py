@@ -143,7 +143,7 @@ def charger_et_nettoyer_dvf(
     sources_chargees = []
     code_insee = str(code_insee)
 
-    for annee in range(2017, 2026):
+    for annee in range(2018, 2026):
         parquets = sorted(dossier.glob(f"**/*{annee}*.parquet"))
         csv_commune = sorted(dossier.glob(f"**/{code_insee}.{annee}.csv"))
         autres_csv = sorted(dossier.glob(f"**/*{annee}*.csv"))
@@ -211,6 +211,7 @@ def charger_et_nettoyer_dvf(
 
         if not df_temp.empty:
             df_temp["annee"] = annee
+            df_temp["source_fichier"] = Path(source).name
             dfs.append(df_temp)
             sources_chargees.append(str(source))
             print(f"✔ {source} : {len(df_temp)} lignes pour {annee}")
@@ -219,6 +220,16 @@ def charger_et_nettoyer_dvf(
         raise FileNotFoundError("Aucun fichier DVF exploitable trouvé.")
 
     df_dvf = pd.concat(dfs, ignore_index=True)
+
+    for col in ("code_commune", "code_postal"):
+        if col in df_dvf.columns:
+            df_dvf[col] = (
+                df_dvf[col]
+                .astype("string")
+                .str.strip()
+                .str.replace(r"\.0$", "", regex=True)
+                .str.zfill(5)
+            )
 
     colonnes_obligatoires = {
         "nature_mutation",
@@ -267,6 +278,48 @@ def charger_et_nettoyer_dvf(
         f"{len(logements)} ventes retenues sur {len(df_dvf)} lignes chargées."
     )
     return logements
+
+
+def creer_data_immo_parquet(
+    code_insee="93070",
+    dossier_source=None,
+    chemin_sortie=None,
+):
+    """Enregistre le résultat filtré de charger_et_nettoyer_dvf en Parquet.
+
+    Les années sans fichier sont ignorées par le chargeur et signalées dans
+    sa sortie. 
+    """
+    df_logements = charger_et_nettoyer_dvf(
+        code_insee=code_insee,
+        dossier=dossier_source,
+    )
+
+    chemin_sortie = (
+        Path(chemin_sortie)
+        if chemin_sortie is not None
+        else DOSSIER_PROJET / "data" / "processed" / "data_immo.parquet"
+    )
+    if chemin_sortie.name in set(df_logements["source_fichier"].unique()):
+        raise ValueError(
+            "Le fichier de sortie ne peut pas porter le nom d'un fichier source."
+        )
+
+    for col in df_logements.select_dtypes(include="object").columns:
+        df_logements[col] = (
+            df_logements[col]
+            .astype("string")
+            .str.replace(r"\.0$", "", regex=True)
+        )
+
+    chemin_sortie.parent.mkdir(parents=True, exist_ok=True)
+    df_logements.to_parquet(chemin_sortie, index=False)
+    annees = sorted(df_logements["annee"].unique().tolist())
+    print(
+        f"Parquet créé : {chemin_sortie} "
+        f"({len(df_logements)} lignes, années {annees})."
+    )
+    return chemin_sortie
 
 
 def rattacher_ventes_aux_iris(df_logements, zone_etude):
