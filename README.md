@@ -17,8 +17,8 @@ L'approche est descriptive : elle mesure des évolutions et des corrélations sp
 ├── main.ipynb          # Notebook principal : analyse, cartes et commentaires
 ├── utils.py            # Fonctions de chargement, nettoyage, calcul et tracé
 ├── requirements.txt    # Dépendances Python
-├── data/
-│   ├── raw/            # Données brutes à placer ici (voir ci-dessous)
+├── data/               # À télécharger depuis l'onglet Releases (data.zip)
+│   ├── raw/            # Données brutes
 │   └── processed/      # Données nettoyées générées par le notebook
 └── README.md
 ```
@@ -43,7 +43,9 @@ L'approche est descriptive : elle mesure des évolutions et des corrélations sp
 | Insee, base infra-communale activité des résidents | Catégories socioprofessionnelles par IRIS | 2011, 2022 |
 | Insee, API Melodi | Population par sexe et âge de la commune | 2012, 2023 |
 
-Les fichiers bruts ne sont pas versionnés. Il faut les télécharger et les placer dans `data/raw/` avec les noms attendus par le notebook :
+Les fichiers bruts ne sont pas versionnés directement dans l'arborescence Git en raison de leur volume. L'ensemble des données prêtes à l'emploi est disponible dans la rubrique **[Releases](https://github.com/borhaney/projet_python_2a_ensae/releases)** du dépôt (archive `data.zip`, version `v1.0.0`).
+
+Une fois l'archive décompressée à la racine du projet, le dossier `data/raw/` regroupe les fichiers suivants attendus par le notebook :
 
 - `IDF_iris.geojson`
 - les fichiers DVF : fichiers `.csv` limités à Saint-Ouen (par exemple `93070.2021.csv`) et fichiers nationaux `.parquet` pour les années plus anciennes (par exemple `dvf-2018.parquet`)
@@ -69,7 +71,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. Placer les fichiers de données dans `data/raw/`.
+4. Télécharger l'archive `data.zip` depuis l'onglet **[Releases](https://github.com/borhaney/projet_python_2a_ensae/releases)** (colonne de droite sur GitHub) et la décompresser à la racine du dépôt pour obtenir le dossier `data/` au même niveau que `main.ipynb`.
 5. Ouvrir `main.ipynb` et exécuter les cellules dans l'ordre. Le notebook doit être lancé depuis la racine du projet, car les chemins vers les données sont relatifs.
 
 Remarque : la lecture des fichiers `.xls` nécessite le paquet `python-calamine`, et celle des fichiers `.xlsx` le paquet `openpyxl`. Vérifier qu'ils figurent dans `requirements.txt`.
