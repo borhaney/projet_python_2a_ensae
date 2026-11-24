@@ -41,3 +41,7 @@ iris.gpkg
 
 *.xls
 projet_python_2a_ensae/
+
+*.pkl
+*.docx
+~$*
