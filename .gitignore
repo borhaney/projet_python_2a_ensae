@@ -9,23 +9,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
-* .pkl
+*.pkl
 
 # --- Jupyter Notebooks (fichiers temporaires de sauvegarde) ---
 .ipynb_checkpoints/
-
-# --- Fichiers de données volumineux ou lourds ---
-# Décommente ou adapte selon le nom de tes dossiers de données
-data/
-*.csv
-*.parquet
-*.xlsx
-*.zip
-*.tar.gz
-*.sqlite3
-*.geojson
-*.txt
-!requirements.txt
 
 # --- Clés d'API et variables d'environnement confidentielles ---
 .env
@@ -37,11 +24,7 @@ Thumbs.db
 # --- Dossiers VS Code locaux ---
 .vscode/
 
-iris.gpkg
-
-*.xls
-projet_python_2a_ensae/
-
-*.pkl
+# --- Documents bureautiques et dossiers obsolètes ---
 *.docx
 ~$*
+projet_python_2a_ensae/
