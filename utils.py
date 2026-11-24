@@ -6,12 +6,16 @@ import unicodedata
 
 import pandas as pd
 import geopandas as gpd
+import requests
 from shapely.ops import unary_union
 
 # Colonne IRIS utilisée dans les jointures et agrégations.
 COL_IRIS = "code_iris"
 
 DOSSIER_PROJET = Path(__file__).resolve().parent
+URL_MELODI = "https://api.insee.fr/melodi/data"
+TABLE_POPULATION_MELODI = "DS_RP_POPULATION_PRINC"
+ANNEES_POPULATION_MELODI = (2012, 2017, 2023)
 
 # Périmètre IRIS
 
@@ -57,6 +61,282 @@ def charger_zone_etude(code_insee="93070"):
     zone_etude[COL_IRIS] = zone_etude[COL_IRIS].astype("string")
     return zone_etude
 
+
+def _charger_observations_melodi(tableau, code_geo, annees):
+    """Télécharge et aplatit des observations de l'API Melodi de l'Insee."""
+    observations = []
+    for annee in annees:
+        try:
+            response = requests.get(
+                f"{URL_MELODI}/{tableau}",
+                params={"GEO": code_geo, "TIME_PERIOD": str(annee)},
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Échec du chargement Melodi pour {code_geo}, année {annee}."
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ValueError(
+                f"Réponse JSON Melodi invalide pour {code_geo}, année {annee}."
+            ) from exc
+
+        lignes = payload.get("observations")
+        if not isinstance(lignes, list):
+            raise ValueError(
+                "La réponse Melodi ne contient pas de liste 'observations'."
+            )
+        if not lignes:
+            raise ValueError(
+                f"Aucune observation Melodi pour {code_geo}, année {annee}."
+            )
+
+        for ligne in lignes:
+            dimensions = ligne.get("dimensions")
+            if not isinstance(dimensions, dict):
+                raise ValueError("Une observation Melodi n'a pas de dimensions.")
+            valeur = (
+                ligne.get("measures", {})
+                .get("OBS_VALUE_NIVEAU", {})
+                .get("value")
+            )
+            observations.append(
+                {
+                    "code_geo": dimensions.get("GEO"),
+                    "sexe": dimensions.get("SEX"),
+                    "annee": int(dimensions.get("TIME_PERIOD", annee)),
+                    "indicateur": dimensions.get("RP_MEASURE"),
+                    "age": dimensions.get("AGE"),
+                    "population": valeur,
+                    "statut": ligne.get("attributes", {}).get("OBS_STATUS"),
+                }
+            )
+
+    resultat = pd.DataFrame(observations)
+    if resultat["population"].isna().any():
+        raise ValueError("La réponse Melodi contient des populations manquantes.")
+    resultat["population"] = pd.to_numeric(resultat["population"], errors="raise")
+    return resultat
+
+
+def charger_population_commune(code_insee="93070", annees=None):
+    """Charge la population communale par sexe et groupes d'âge via Melodi.
+
+    L'API diffuse actuellement les millésimes 2012, 2017 et 2023 pour ce
+    tableau. Ce sont des années de référence du recensement, pas des données
+    pour 2011 ou l'année courante.
+    """
+    code_insee = str(code_insee).strip().removesuffix(".0")
+    if not code_insee.isdigit() or len(code_insee) > 5:
+        raise ValueError(f"Code INSEE communal invalide : {code_insee!r}.")
+    code_insee = code_insee.zfill(5)
+
+    if annees is None:
+        annees = ANNEES_POPULATION_MELODI
+    elif isinstance(annees, (int, str)):
+        annees = (int(annees),)
+    else:
+        annees = tuple(int(annee) for annee in annees)
+    if not annees:
+        raise ValueError("La liste des années Melodi ne peut pas être vide.")
+    if len(set(annees)) != len(annees):
+        raise ValueError("Les années Melodi doivent être uniques.")
+
+    return _charger_observations_melodi(
+        TABLE_POPULATION_MELODI,
+        code_geo=f"COM-{code_insee}",
+        annees=annees,
+    )
+
+
+def preparer_pyramide_ages(population_commune, annee=None):
+    """Prépare les effectifs par âge et sexe pour le graphique de pyramide.
+
+    Par défaut, retourne 2017 et 2023 si ces millésimes sont présents;
+    sinon, les millésimes disponibles le plus ancien et le plus récent.
+    """
+    colonnes_requises = {"annee", "sexe", "age", "population", "indicateur"}
+    colonnes_absentes = colonnes_requises - set(population_commune.columns)
+    if colonnes_absentes:
+        raise ValueError(
+            "Colonnes absentes des données de population : "
+            f"{sorted(colonnes_absentes)}."
+        )
+
+    annees_colonne = pd.to_numeric(population_commune["annee"], errors="coerce")
+    annees_disponibles = sorted(annees_colonne.dropna().astype(int).unique())
+    if annee is None:
+        if not annees_disponibles:
+            raise ValueError("Aucune année valide dans les données de population.")
+        if 2017 in annees_disponibles and 2023 in annees_disponibles:
+            annees_a_conserver = [2017, 2023]
+        else:
+            annees_a_conserver = sorted(
+                {annees_disponibles[0], annees_disponibles[-1]}
+            )
+        if len(annees_a_conserver) < 2:
+            raise ValueError(
+                "Il faut au moins deux millésimes pour comparer les pyramides."
+            )
+    elif isinstance(annee, (int, str)):
+        annees_a_conserver = [int(annee)]
+    else:
+        annees_a_conserver = sorted({int(millesime) for millesime in annee})
+        if not annees_a_conserver:
+            raise ValueError("La liste des années ne peut pas être vide.")
+
+    groupes_age = {
+        "Y_LT15": "0–14 ans",
+        "Y15T24": "15–24 ans",
+        "Y25T39": "25–39 ans",
+        "Y40T54": "40–54 ans",
+        "Y55T64": "55–64 ans",
+        "Y65T79": "65–79 ans",
+        "Y_GE80": "80 ans ou plus",
+    }
+    donnees = population_commune.loc[
+        annees_colonne.isin(annees_a_conserver)
+        & population_commune["indicateur"].eq("POP")
+        & population_commune["sexe"].isin(["F", "M"])
+        & population_commune["age"].isin(groupes_age)
+    ]
+    if donnees.empty:
+        raise ValueError(
+            "Aucune donnée de pyramide pour les années "
+            f"{annees_a_conserver}."
+        )
+
+    pyramide = donnees.pivot(
+        index=["annee", "age"],
+        columns="sexe",
+        values="population",
+    ).reset_index()
+    pyramide = pyramide.loc[
+        pyramide["annee"].isin(annees_a_conserver)
+    ].copy()
+    if not {"F", "M"}.issubset(pyramide.columns):
+        raise ValueError("Les effectifs femmes/hommes sont incomplets.")
+    if pyramide[["F", "M"]].isna().any().any():
+        raise ValueError("Les effectifs femmes/hommes sont incomplets.")
+
+    pyramide["annee"] = pyramide["annee"].astype(int)
+    pyramide["classe_age"] = pyramide["age"].map(groupes_age)
+    pyramide = pyramide.sort_values(
+        ["annee", "age"],
+        key=lambda colonne: (
+            colonne.map({code: ordre for ordre, code in enumerate(groupes_age)})
+            if colonne.name == "age"
+            else colonne
+        ),
+    )
+    pyramide = pyramide.rename(columns={"F": "femmes", "M": "hommes"})
+    pyramide["tranche_age"] = pyramide["classe_age"]
+    return pyramide[
+        ["annee", "age", "classe_age", "tranche_age", "femmes", "hommes"]
+    ].reset_index(drop=True)
+
+
+def calculer_evolution_population_commune(
+    population_commune,
+    annee_debut=2012,
+    annee_fin=2023,
+):
+    """Calcule l'évolution de la population totale entre deux millésimes."""
+    colonnes_requises = {"annee", "sexe", "age", "population", "indicateur"}
+    colonnes_absentes = colonnes_requises - set(population_commune.columns)
+    if colonnes_absentes:
+        raise ValueError(
+            "Colonnes absentes des données de population : "
+            f"{sorted(colonnes_absentes)}."
+        )
+
+    annees = pd.to_numeric(population_commune["annee"], errors="coerce")
+    totaux = population_commune.loc[
+        population_commune["indicateur"].eq("POP")
+        & population_commune["sexe"].eq("_T")
+        & population_commune["age"].eq("_T")
+    ].assign(annee=annees)
+    totaux = totaux.set_index("annee")["population"]
+
+    valeurs = {}
+    for annee in (int(annee_debut), int(annee_fin)):
+        if annee not in totaux.index:
+            raise ValueError(f"Population totale absente pour l'année {annee}.")
+        selection = totaux.loc[annee]
+        if isinstance(selection, pd.Series):
+            if len(selection) != 1:
+                raise ValueError(f"Population totale ambiguë pour l'année {annee}.")
+            selection = selection.iloc[0]
+        valeurs[annee] = float(selection)
+
+    debut, fin = valeurs[int(annee_debut)], valeurs[int(annee_fin)]
+    variation = fin - debut
+    variation_pct = pd.NA if debut == 0 else variation / debut * 100
+    return pd.DataFrame(
+        [
+            {
+                "annee_debut": int(annee_debut),
+                "annee_fin": int(annee_fin),
+                "population_debut": debut,
+                "population_fin": fin,
+                "variation_absolue": variation,
+                "variation_pourcent": variation_pct,
+            }
+        ]
+    )
+
+
+
+def charger_stations_proches(zone_etude, chemin=None, marge=0.05):
+    """Charge les gares proches de la zone d'étude à partir du GeoJSON local."""
+    if not isinstance(zone_etude, gpd.GeoDataFrame):
+        raise TypeError("zone_etude doit être un GeoDataFrame.")
+    if zone_etude.empty:
+        raise ValueError("La zone d'étude est vide.")
+    if zone_etude.crs is None:
+        raise ValueError("La zone d'étude ne précise pas son CRS.")
+
+    try:
+        marge = float(marge)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("marge doit être un nombre positif ou nul.") from exc
+    if not pd.notna(marge) or marge < 0:
+        raise ValueError("marge doit être un nombre positif ou nul.")
+
+    if chemin is None:
+        chemin = (
+            DOSSIER_PROJET
+            / "data"
+            / "raw"
+            / "emplacement-des-gares-idf.geojson"
+        )
+    else:
+        chemin = Path(chemin)
+        if not chemin.is_absolute():
+            chemin = DOSSIER_PROJET / chemin
+    if not chemin.is_file():
+        raise FileNotFoundError(f"Fichier de gares introuvable : {chemin}")
+
+    stations = gpd.read_file(chemin)
+    if stations.empty:
+        raise ValueError(f"Le fichier de gares est vide : {chemin}")
+    if stations.crs is None:
+        raise ValueError(f"Le fichier de gares ne précise pas son CRS : {chemin}")
+    stations = stations.to_crs(zone_etude.crs)
+
+    minx, miny, maxx, maxy = zone_etude.total_bounds
+    marge_x = (maxx - minx) * marge
+    marge_y = (maxy - miny) * marge
+    stations_proches = stations.cx[
+        minx - marge_x : maxx + marge_x,
+        miny - marge_y : maxy + marge_y,
+    ].copy()
+    if stations_proches.empty:
+        raise ValueError("Aucune gare trouvée autour du périmètre d'étude.")
+    return stations_proches
 
 
 # Ligne 14
