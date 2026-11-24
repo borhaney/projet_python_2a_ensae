@@ -5,3 +5,5 @@ shapely
 adjustText
 contextily
 requests
+openpyxl
+python-calamine
